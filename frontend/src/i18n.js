@@ -6,6 +6,16 @@ export const languageOptions = [
 
 export const messages = {
   en: {
+    runControls: "Run controls", runForecast: "Run forecast", runReplay: "Run full replay", savedRun: "Saved run ID", loadRun: "Load run",
+    statusIdle: "Ready", statusSkipped: "Skipped", descIdle: "Choose an origin and start a forecast.",
+    emptyIdleTitle: "Ready to forecast", emptyIdleDesc: "Select an origin and run the backend to retrieve a forecast.",
+    farmAggregate: "Farm aggregate", aggregateUnavailable: "Farm aggregate unavailable", unchangedInputs: "Unchanged inputs reused",
+    agentDecisions: "Agent decisions", replaySummary: "Replay progress", viewOrigin: "View origin",
+    total_origins: "Total origins", success: "Successful", blocked: "Blocked", failed: "Failed",
+    with_farm_aggregate: "Aggregates available", without_farm_aggregate: "Aggregates unavailable",
+    availabilityMethod: "Availability method", availabilityBound: "Available by", weatherCoverage: "Coverage", selectionReason: "Selection reason",
+    stepLoad: "Load CSV data", stepAggregate: "Aggregate hourly", stepTrain: "Train or load models", stepEligibility: "Check eligibility",
+    stepFeatures: "Prepare features", stepPersist: "Save artifacts", stepRecalculate: "Check recalculation", stepReplay: "Process origin",
     language: "Interface language", brandHome: "Wind Replay home", brandSubtitle: "Energy forecast operations",
     replayOrigin: "REPLAY ORIGIN", heading: "Forecast replay",
     intro: "Hourly wind generation forecast with its replay origin, weather source and evidence in one view.",
@@ -67,6 +77,16 @@ export const messages = {
     warningApiTitle: "API UNAVAILABLE",
   },
   ru: {
+    runControls: "Управление запуском", runForecast: "Рассчитать прогноз", runReplay: "Запустить весь период", savedRun: "ID сохранённого запуска", loadRun: "Загрузить",
+    statusIdle: "Готов", statusSkipped: "Пропущено", descIdle: "Выберите дату и запустите прогноз.",
+    emptyIdleTitle: "Готов к расчёту", emptyIdleDesc: "Выберите дату и запустите расчёт на сервере.",
+    farmAggregate: "Общий прогноз станции", aggregateUnavailable: "Общий прогноз недоступен", unchangedInputs: "Входные данные не изменились",
+    agentDecisions: "Решения агента", replaySummary: "Ход воспроизведения", viewOrigin: "Показать дату",
+    total_origins: "Всего дат", success: "Успешно", blocked: "Заблокировано", failed: "Ошибок",
+    with_farm_aggregate: "Общие прогнозы доступны", without_farm_aggregate: "Общие прогнозы недоступны",
+    availabilityMethod: "Метод доступности", availabilityBound: "Доступен к", weatherCoverage: "Покрытие", selectionReason: "Причина выбора",
+    stepLoad: "Загрузка CSV", stepAggregate: "Почасовые средние", stepTrain: "Обучение или загрузка модели", stepEligibility: "Проверка доступности",
+    stepFeatures: "Подготовка признаков", stepPersist: "Сохранение результатов", stepRecalculate: "Проверка пересчёта", stepReplay: "Расчёт даты",
     language: "Язык интерфейса", brandHome: "Главная Wind Replay", brandSubtitle: "Оперативный прогноз выработки",
     replayOrigin: "МОМЕНТ ПРОГНОЗА", heading: "Повторный прогноз",
     intro: "Почасовой прогноз выработки ветроустановок с исходным моментом, погодными данными и подтверждением источника.",
@@ -128,6 +148,16 @@ export const messages = {
     warningApiTitle: "API НЕДОСТУПЕН",
   },
   kk: {
+    runControls: "Іске қосуды басқару", runForecast: "Болжамды есептеу", runReplay: "Толық кезеңді іске қосу", savedRun: "Сақталған іске қосу ID", loadRun: "Жүктеу",
+    statusIdle: "Дайын", statusSkipped: "Өткізілді", descIdle: "Күнді таңдап, болжамды бастаңыз.",
+    emptyIdleTitle: "Есептеуге дайын", emptyIdleDesc: "Күнді таңдап, серверде болжамды есептеңіз.",
+    farmAggregate: "Станцияның жалпы болжамы", aggregateUnavailable: "Жалпы болжам қолжетімсіз", unchangedInputs: "Өзгермеген деректер қолданылды",
+    agentDecisions: "Агент шешімдері", replaySummary: "Қайта есептеу барысы", viewOrigin: "Күнді көрсету",
+    total_origins: "Барлық күндер", success: "Сәтті", blocked: "Бұғатталған", failed: "Қателер",
+    with_farm_aggregate: "Жалпы болжам бар", without_farm_aggregate: "Жалпы болжам жоқ",
+    availabilityMethod: "Қолжетімділік әдісі", availabilityBound: "Қолжетімді уақыт", weatherCoverage: "Қамту", selectionReason: "Таңдау себебі",
+    stepLoad: "CSV жүктеу", stepAggregate: "Сағаттық орташа", stepTrain: "Модельді оқыту не жүктеу", stepEligibility: "Қолжетімділікті тексеру",
+    stepFeatures: "Белгілерді дайындау", stepPersist: "Нәтижені сақтау", stepRecalculate: "Қайта есептеуді тексеру", stepReplay: "Күнді есептеу",
     language: "Интерфейс тілі", brandHome: "Wind Replay басты беті", brandSubtitle: "Энергия болжамын бақылау",
     replayOrigin: "БОЛЖАМ БАСТАЛҒАН УАҚЫТ", heading: "Болжамды қайта жүргізу",
     intro: "Жел турбиналары өндірісінің сағаттық болжамы, бастапқы уақыты, ауа райы көзі және дәлелдері бір жерде.",
@@ -191,6 +221,10 @@ export const messages = {
 };
 
 export const knownSteps = {
+  load_data: "stepLoad", validate_data: "stepValidation", aggregate_hourly: "stepAggregate",
+  train_or_load_models: "stepTrain", retrieve_weather: "stepWeather", validate_eligibility: "stepEligibility",
+  prepare_features: "stepFeatures", forecast: "stepModel", analyze: "stepAnalysis",
+  decide_recalculation: "stepRecalculate", persist: "stepPersist", run_origin: "stepReplay",
   "Weather retrieval": "stepWeather",
   "Input validation": "stepValidation",
   "Forecast model": "stepModel",

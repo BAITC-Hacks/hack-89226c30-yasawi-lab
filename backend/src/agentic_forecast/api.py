@@ -16,7 +16,7 @@ from .config import COORDINATES, CONFIGURATION_ID, FIRST_ORIGIN, LAST_ORIGIN, de
 
 settings = default_settings()
 app = FastAPI(title="Wind Replay backend", version="1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+app.add_middleware(CORSMiddleware, allow_origins=list(settings.frontend_origins),
                    allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 executor = ThreadPoolExecutor(max_workers=1)
 active_lock = threading.Lock()
@@ -34,7 +34,8 @@ class RunRequest(BaseModel):
 
 @app.get("/api/context")
 def context() -> dict:
-    return {"schema_version": "1.0", "project_timezone": settings.timezone, "horizon_hours": 48,
+    return {"schema_version": "1.0", "configuration_id": CONFIGURATION_ID,
+            "project_timezone": settings.timezone, "horizon_hours": 48,
             "turbines": [{"turbine_id": tid, "dataset_id": f"dataset_{tid[-1]}.csv",
                           "coordinate": {"latitude": value[0], "longitude": value[1]}, "coordinate_source": value[2]}
                          for tid, value in COORDINATES.items()],

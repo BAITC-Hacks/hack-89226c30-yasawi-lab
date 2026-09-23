@@ -1,6 +1,6 @@
-# Wind Replay backend
+# Wind Replay
 
-This repository implements the backend in [BACKEND_TASK.md](BACKEND_TASK.md) for the [HackAlem wind forecasting task](task.md). Backend code, tests, configuration, and artifacts live in `backend/`; the original CSVs remain in root `data/`. It produces 48 hourly normalized-power predictions for each turbine at the first origin, **2026-01-31T00:00:00+05:00**, and at every local midnight through **2026-02-28T00:00:00+05:00**. The five judging categories are task/workability (25), technical implementation (25), README/reproducibility (25), value/applicability (15), and development potential/originality (10).
+This repository implements the backend in [BACKEND_TASK.md](BACKEND_TASK.md) for the [HackAlem wind forecasting task](task.md), with a React/Vite frontend. Backend code, tests, configuration, and artifacts live in `backend/`; the browser application lives in `frontend/`; the original CSVs remain in root `data/`. It produces 48 hourly normalized-power predictions for each turbine at the first origin, **2026-01-31T00:00:00+05:00**, and at every local midnight through **2026-02-28T00:00:00+05:00**. The five judging categories are task/workability (25), technical implementation (25), README/reproducibility (25), value/applicability (15), and development potential/originality (10).
 
 ## Source data and fixed configuration
 
@@ -41,7 +41,35 @@ Each turbine calculation fingerprints its origin, source CSV hash, model version
 
 ## Install and run
 
-Use Python 3.10 or newer:
+Use Python 3.10+ and a supported Node.js release (20.19+ or 22.12+). From the repository root, install both projects and create local configuration. PowerShell commands:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e './backend[test]'
+npm ci --prefix frontend
+Copy-Item .env.example .env
+Copy-Item frontend/.env.example frontend/.env.local
+python scripts/dev.py
+```
+
+On macOS/Linux, activate with `source .venv/bin/activate` and use `cp` for the two configuration copies. Visit **http://127.0.0.1:5173**. The launcher starts FastAPI and Vite, uses strict ports, and stops both when you press Ctrl+C or either server exits. `python scripts/dev.py --check` verifies local configuration and imports without starting either server. No Docker, database service, API key, or authentication setup is needed.
+
+The launcher reads root `.env` and `frontend/.env.local`; values already set in the shell take priority. `.env` files are ignored by Git. It supplies a development API base when no frontend value is set. Configuration:
+
+| Variable | Default | Used by |
+| --- | --- | --- |
+| `BACKEND_HOST` | `127.0.0.1` | Local launcher: FastAPI bind address |
+| `BACKEND_PORT` | `8000` | Local launcher: FastAPI port |
+| `FRONTEND_ORIGIN` | `http://127.0.0.1:5173` in the example | Backend CORS; local launcher uses this single origin for Vite host/port |
+| `VITE_API_BASE_URL` | `http://127.0.0.1:8000` in `frontend/.env.example` | Central browser API client; public build configuration |
+| `WIND_PROJECT_TIMEZONE` | `Asia/Almaty` | Approved backend time convention |
+| `WIND_PROVIDER_TIMEOUT_SECONDS` | `15` | Backend archive request timeout |
+| `WIND_WEATHER_BASE_URL` | Open-Meteo Single Runs endpoint | Backend weather provider; keep the approved default |
+
+`VITE_*` settings are public and are embedded during `npm run build`; never put secrets in them. If the API address changes, update `frontend/.env.local` and restart Vite or rebuild. For a port change using the launcher, update the matching origin/API values as well. The backend also accepts comma-separated exact origins in `FRONTEND_ORIGIN` for independent deployment; the combined local launcher expects one HTTP origin.
+
+Independent startup still works. From `backend/`, with the Python environment activated:
 
 ```powershell
 cd backend
@@ -52,7 +80,31 @@ python -m uvicorn agentic_forecast.api:app --host 127.0.0.1 --port 8000
 python -m pytest -q tests
 ```
 
-The CLI prints its run ID, status, forecast-row count, progress, summary, and errors. Its saved JSON is `backend/artifacts/runs/<run_id>.json` relative to the repository root. The replay file contains all 29 per-origin details and counts; child run JSONs are retained alongside it. These environment variables are supported: `WIND_PROJECT_TIMEZONE` (default `Asia/Almaty`), `WIND_WEATHER_BASE_URL` (default Single Runs endpoint), and `WIND_PROVIDER_TIMEOUT_SECONDS` (default 15). Changing timezone or provider is unsupported for the approved configuration unless separately verified. No API key is required. Internet access and a valid TLS trust store are needed for live archive retrieval; offline tests use local fixture bytes and provenance checks.
+From `frontend/` in a second terminal:
+
+```powershell
+npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
+npm run build
+```
+
+Vite reads `frontend/.env.local` itself. Independent Uvicorn startup reads shell environment variables; it does not load root `.env` automatically. For an origin other than the backend's default localhost/127.0.0.1 port 5173 origins, set `$env:FRONTEND_ORIGIN='http://127.0.0.1:5173'` (or `export FRONTEND_ORIGIN=...` on macOS/Linux) before starting Uvicorn.
+
+The CLI prints its run ID, status, forecast-row count, progress, summary, and errors. Its saved JSON is `backend/artifacts/runs/<run_id>.json` relative to the repository root. The replay file contains all 29 per-origin details and counts; child run JSONs are retained alongside it. Changing timezone or provider is unsupported for the approved configuration unless separately verified. Internet access and a valid TLS trust store are needed for live archive retrieval; offline tests use local fixture bytes and provenance checks.
+
+## Browser integration
+
+The central frontend API client reads `VITE_API_BASE_URL`. It loads configuration from FastAPI, submits an origin or replay, then polls that accepted run's URL until the backend returns a terminal status. The backend owns CSV validation, model fitting, weather eligibility, provenance, replay and calculation reuse. All model/weather values shown by the browser come from the returned run; there is no frontend calculation of a farm aggregate or weather availability.
+
+| Frontend data/action | HTTP route | Response used |
+| --- | --- | --- |
+| Configuration, turbines, origin range | `GET /api/context` | Coordinates, capabilities, timezone and approved origins |
+| Calculate selected origin or recalculate | `POST /api/runs` with `mode: "single"` | Accepted run ID and polling URL |
+| Run the approved replay | `POST /api/runs` with `mode: "replay"` | Accepted replay ID and polling URL |
+| Forecast, weather, agent and replay details | `GET /api/runs/{run_id}` | Status, forecasts, provenance, progress and reasons |
+
+`completed` displays returned predictions; `blocked` displays the backend's intentional blocker; `failed` displays its safe failure information. Queued/running states show progress, request failures show a retryable error, and a new calculation clears the prior result to prevent stale output. An unavailable prediction or aggregate remains unavailable; a null farm aggregate displays its structured reason and never becomes zero MW. Backend ISO timestamps retain their timezone; display formatting does not alter calculation inputs.
+
+Development uses direct browser-to-API requests and exact allowed CORS origins, with no proxy. For separate production origins, build the frontend with the browser-reachable HTTPS `VITE_API_BASE_URL` and set the backend's `FRONTEND_ORIGIN` to the exact deployed frontend origin. Serve `frontend/dist/` using your static host and run Uvicorn behind your deployment's HTTPS endpoint. A same-origin deployment may leave `VITE_API_BASE_URL` empty and route `/api` to the backend; no reverse proxy or hosting configuration is supplied in this repository. The local launcher is for development.
 
 ## API contract
 
@@ -85,7 +137,7 @@ GET /api/runs/<run_id>
 }
 ```
 
-This summary omits the 96 `forecasts` rows and model/data/weather manifests; the saved response contains them. Each turbine has 48 consecutive hourly normalized predictions with `weather_snapshot_id`, `model_version`, and `in_test_period`. The first 24 valid hours are January and have `in_test_period=false`; the next 24 are February and true. The repository currently has no `frontend/` directory, so there is no frontend start command to verify here.
+This summary omits the 96 `forecasts` rows and model/data/weather manifests; the saved response contains them. Each turbine has 48 consecutive hourly normalized predictions with `weather_snapshot_id`, `model_version`, and `in_test_period`. The first 24 valid hours are January and have `in_test_period=false`; the next 24 are February and true.
 
 ## Verification and next step
 

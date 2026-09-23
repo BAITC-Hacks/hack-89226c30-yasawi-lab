@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
-import { getForecastRun } from "./api/forecast.js";
+import { useForecast } from "./api/useForecast.js";
 import { knownSteps, knownWarnings, languageOptions, translate } from "./i18n.js";
 
 const HORIZON_HOURS = 48;
 const DEFAULT_TIMEZONE = "Asia/Almaty";
 const turbines = {
-  turbine_1: { labelKey: "turbine1", dataset: "dataset_1.csv", color: "#147d73" },
-  turbine_2: { labelKey: "turbine2", dataset: "dataset_2.csv", color: "#bd7448" },
+  turbine_1: { labelKey: "turbine1", color: "#147d73" },
+  turbine_2: { labelKey: "turbine2", color: "#bd7448" },
 };
 
 const statusDetails = {
+  idle: { tone: "neutral" },
   queued: { tone: "neutral" }, running: { tone: "blue" }, completed: { tone: "green" },
   partial: { tone: "amber" }, blocked: { tone: "amber" }, failed: { tone: "red" },
 };
@@ -73,23 +74,9 @@ function LanguageSwitch({ language, onChange, t }) {
 
 function localizedWarning(item, t) {
   const keys = knownWarnings[item.code];
-  return keys ? { title: t(keys[0]), message: t(keys[1]) } : {
+  return keys ? { title: t(keys[0]), message: item.message || t(keys[1]) } : {
     title: item.code?.replaceAll("_", " ") || "—", message: item.message,
   };
-}
-
-function displaySteps(data, status) {
-  const source = data.agent?.steps || [];
-  if (!data.is_mock || status === "completed") return source;
-  return source.map((step, index) => {
-    if (status === "running" || status === "queued") {
-      return { ...step, status: index === 0 ? "completed" : index === 1 && status === "running" ? "running" : "queued" };
-    }
-    if (status === "partial") {
-      return { ...step, status: index < source.length - 1 ? "completed" : "partial" };
-    }
-    return { ...step, status: index === 0 ? "completed" : index === 1 ? status : "queued" };
-  });
 }
 
 function ForecastChart({ activeSeries, comparisonSeries, activeTurbine, timeZone, locale, t }) {
@@ -190,12 +177,14 @@ function EmptyForecast({ status, turbineLabel, errors = [], action = null, t }) 
   );
 }
 
-function App() {
-  const [data, setData] = useState(null);
-  const [loadError, setLoadError] = useState(null);
+export function ForecastDashboard({ controller, initialLanguage }) {
+  const { context, run, data: currentData, error: loadError, busy, originDate, setOriginDate,
+    selectedOrigin, setSelectedOrigin, loadingDetail, execute, retryContext } = controller;
+  const data = currentData || {};
+  const [savedRunId, setSavedRunId] = useState("");
   const [activeTurbine, setActiveTurbine] = useState("turbine_1");
-  const [previewStatus, setPreviewStatus] = useState("completed");
   const [language, setLanguage] = useState(() => {
+    if (initialLanguage) return initialLanguage;
     try {
       const saved = window.localStorage.getItem("wind-replay-language");
       return languageOptions.some((option) => option.code === saved) ? saved : "ru";
@@ -211,38 +200,14 @@ function App() {
     try { window.localStorage.setItem("wind-replay-language", language); } catch { /* Storage may be unavailable. */ }
   }, [language]);
 
-  useEffect(() => {
-    let disposed = false;
-    let timer;
-    async function load() {
-      try {
-        const result = await getForecastRun();
-        if (disposed) return;
-        setData(result);
-        setLoadError(null);
-        if (!result.is_mock && ["queued", "running"].includes(result.status)) {
-          timer = window.setTimeout(load, 3000);
-        }
-      } catch (error) {
-        if (!disposed) setLoadError(error.message);
-      }
-    }
-    load();
-    return () => { disposed = true; window.clearTimeout(timer); };
-  }, []);
-
-  const originAt = data?.forecasts?.[0]?.origin_at || data?.origin_at || null;
-  const timeZone = data?.weather_snapshots?.[0]?.project_timezone || DEFAULT_TIMEZONE;
-  const status = data?.is_mock ? previewStatus : data?.status === "error" ? "failed" : data?.status || "queued";
+  const originAt = data.origin_at || selectedOrigin || context?.origin_range?.first || null;
+  const timeZone = context?.project_timezone || DEFAULT_TIMEZONE;
+  const status = data.status || (busy || loadingDetail ? "running" : "idle");
   const originRows = useMemo(() =>
     (data?.forecasts || []).filter((row) => row.origin_at === originAt),
     [data, originAt]
   );
-  const visibleRows = status === "completed" || status === "partial"
-    ? data?.is_mock && status === "partial"
-      ? originRows.filter((row) => row.turbine_id === "turbine_1")
-      : originRows
-    : [];
+  const visibleRows = status === "completed" || status === "partial" ? originRows : [];
   const series = {
     turbine_1: visibleRows.filter((row) => row.turbine_id === "turbine_1").sort((a, b) => a.lead_hours - b.lead_hours),
     turbine_2: visibleRows.filter((row) => row.turbine_id === "turbine_2").sort((a, b) => a.lead_hours - b.lead_hours),
@@ -250,29 +215,32 @@ function App() {
   const activeSeries = series[activeTurbine];
   const comparisonSeries = series[activeTurbine === "turbine_1" ? "turbine_2" : "turbine_1"];
   const numericRows = activeSeries.filter((row) => Number.isFinite(row.power_normalized));
-  const values = numericRows.map((row) => row.power_normalized);
-  const mean = values.length ? values.reduce((total, value) => total + value, 0) / values.length : null;
-  const peak = values.length ? Math.max(...values) : null;
+  const turbineSummary = data.summary?.per_turbine?.[activeTurbine];
+  const mean = turbineSummary?.mean;
+  const peak = turbineSummary?.max;
   const peakRow = peak === null ? null : numericRows.find((row) => row.power_normalized === peak);
   const totalCoverage = visibleRows.filter((row) => Number.isFinite(row.power_normalized)).length;
   const weatherId = activeSeries[0]?.weather_snapshot_id;
   const weather = data?.weather_snapshots?.find((snapshot) => snapshot.weather_snapshot_id === weatherId)
-    || data?.weather_snapshots?.[0];
-  const requestedSite = weather?.requested_coordinates?.find((site) => site.turbine_id === activeTurbine);
-  const steps = data ? displaySteps(data, status) : [];
+    || data?.weather_snapshots?.find((snapshot) => snapshot.turbine_id === activeTurbine);
+  const requestedSite = weather?.requested_coordinate;
+  const steps = data.agent?.steps || [];
   const warningList = data?.warnings || [];
   const errors = data?.errors || [];
   const revisionRows = activeSeries.filter((row) => Number.isFinite(row.revision_delta));
   const firstRevision = revisionRows[0];
   const turbineLabel = t(turbines[activeTurbine].labelKey);
+  const turbineStatus = data.turbine_outcomes?.[activeTurbine] || status;
+  const turbineErrors = errors.filter((item) => !item.details?.turbine_id || item.details.turbine_id === activeTurbine);
+  const decisions = data.agent?.decisions || [];
 
-  if (loadError) {
+  if (loadError && !context) {
     return <main className="app-shell"><header className="topbar"><strong className="brand-name">Wind Replay</strong><div className="topbar-right"><StatusPill status="failed" t={t} /><LanguageSwitch language={language} onChange={setLanguage} t={t} /></div></header>
       <div className="load-failure"><EmptyForecast status="failed" turbineLabel={turbineLabel} t={t}
-        errors={[{ code: "API_UNAVAILABLE", message: loadError }]}
-        action={<button className="retry-button" onClick={() => window.location.reload()}>{t("retryLoading")}</button>} /></div></main>;
+        errors={[{ code: loadError.code || "API_UNAVAILABLE", message: loadError.message }]}
+        action={<button className="retry-button" onClick={retryContext}>{t("retryLoading")}</button>} /></div></main>;
   }
-  if (!data) {
+  if (!context) {
     return <main className="app-shell"><header className="topbar"><strong className="brand-name">Wind Replay</strong><div className="topbar-right"><StatusPill status="running" t={t} /><LanguageSwitch language={language} onChange={setLanguage} t={t} /></div></header>
       <div className="initial-loading" role="status"><span className="loading-spinner" /><strong>{t("loadingTitle")}</strong><p>{t("loadingDescription")}</p></div></main>;
   }
@@ -284,7 +252,7 @@ function App() {
           <span><strong className="brand-name">Wind Replay</strong><small>{t("brandSubtitle")}</small></span></a>
         <div className="topbar-right">
           <span className="topbar-origin"><small>{t("replayOrigin")}</small><strong>{formatDate(originAt, timeZone, locale)} <span>{formatHour(originAt, timeZone, locale)}</span></strong></span>
-          <StatusPill status={status} t={t} />
+          <StatusPill status={run?.status || status} t={t} />
           <LanguageSwitch language={language} onChange={setLanguage} t={t} />
         </div>
       </header>
@@ -297,29 +265,41 @@ function App() {
           <div className="mobile-origin"><span>{t("replayOrigin")}</span><strong>{formatDate(originAt, timeZone, locale)} · {formatHour(originAt, timeZone, locale)} {timeZone}</strong></div>
         </div>
         <div className="run-context">
-          <span>{t("runId")} <code>{data.run_id}</code></span>
-          {data.is_mock && <span className="mock-badge">{t("mockBadge")}</span>}
+          <span>{t("runId")} <code>{run?.run_id || "—"}</code></span>
         </div>
       </section>
 
-      {data.is_mock && (
-        <div className="preview-bar">
-          <span>{t("previewStatus")} <small>{t("mockOnly")}</small></span>
-          <div className="preview-controls" aria-label={t("previewAria")}>
-            {["running", "completed", "partial", "blocked", "failed"].map((item) =>
-              <button key={item} className={status === item ? "active" : ""} aria-pressed={status === item}
-                onClick={() => setPreviewStatus(item)}>{t(`status${item[0].toUpperCase()}${item.slice(1)}`)}</button>
-            )}
-          </div>
-        </div>
-      )}
+      <section className="run-controls panel" aria-label={t("runControls")}>
+        <form onSubmit={(event) => { event.preventDefault(); execute("single"); }}>
+          <label>{t("runOrigin")}<input aria-label={t("runOrigin")} type="date" value={originDate}
+            min={context.origin_range.first.slice(0, 10)} max={context.origin_range.last.slice(0, 10)}
+            disabled={busy} required onChange={(event) => setOriginDate(event.target.value)} /></label>
+          <button className="primary-button" disabled={busy || !originDate}>{t(busy ? "statusRunning" : "runForecast")}</button>
+          <button type="button" disabled={busy || !context.capabilities?.replay} onClick={() => execute("replay")}>{t("runReplay")}</button>
+        </form>
+        <form onSubmit={(event) => { event.preventDefault(); execute("single", savedRunId.trim()); }}>
+          <label>{t("savedRun")}<input aria-label={t("savedRun")} value={savedRunId} placeholder={t("runId")}
+            pattern="[a-f0-9]{32}" required disabled={busy} onChange={(event) => setSavedRunId(event.target.value)} /></label>
+          <button disabled={busy || !savedRunId.trim()}>{t("loadRun")}</button>
+        </form>
+      </section>
+      {loadError && <div className="inline-notice red" role="alert"><StatusIcon status="failed" />
+        <span><strong>{loadError.code || "API_UNAVAILABLE"}</strong> · {loadError.message}</span></div>}
+      {run?.mode === "replay" && <section className="panel replay-summary" aria-label={t("replaySummary")}>
+        <h2>{t("replaySummary")}</h2>
+        <div className="replay-counts">{["total_origins", "success", "blocked", "failed", "with_farm_aggregate", "without_farm_aggregate"].map((key) =>
+          <span key={key}>{t(key)} <strong>{run.summary?.[key] ?? (key === "total_origins" ? run.progress?.total_origins : "—")}</strong></span>)}</div>
+        {!!run.origins?.length && <label>{t("viewOrigin")}<select value={selectedOrigin} aria-label={t("viewOrigin")}
+          onChange={(event) => setSelectedOrigin(event.target.value)}>{run.origins.map((item) =>
+            <option key={item.origin_at} value={item.origin_at}>{formatDate(item.origin_at, timeZone, locale)} · {t(`status${item.status[0].toUpperCase()}${item.status.slice(1)}`)}</option>)}</select></label>}
+      </section>}
 
       <section className="kpi-strip" aria-label={t("overviewAria")}>
-        <div className="kpi"><span>{t("forecastHorizon")}</span><strong>48 <small>{t("hours")}</small></strong><p>{t("hourlyIntervals")}</p></div>
-        <div className="kpi"><span>{t("turbines")}</span><strong>02 <small>{t("units")}</small></strong><p>{t("separateSeries")}</p></div>
+        <div className="kpi"><span>{t("forecastHorizon")}</span><strong>{context.horizon_hours} <small>{t("hours")}</small></strong><p>{t("hourlyIntervals")}</p></div>
+        <div className="kpi"><span>{t("turbines")}</span><strong>{context.turbines.length} <small>{t("units")}</small></strong><p>{t("separateSeries")}</p></div>
         <div className="kpi"><span>{t(status === "blocked" ? "candidateWeatherRun" : "weatherRun")}</span>
           <strong className="kpi-date">{weather ? formatTime(weather.run_at_utc, "UTC", locale) : "—"} <small>UTC</small></strong>
-          <p>{weather?.source_model || t("noRunRecorded")}</p></div>
+          <p>{weather?.model || t("noRunRecorded")}</p></div>
         <div className="kpi"><span>{t("dataCoverage")}</span><strong>{totalCoverage} <small>/ {HORIZON_HOURS * 2} {t("hours")}</small></strong>
           <p>{t("rowsWithForecasts")}</p></div>
       </section>
@@ -330,13 +310,13 @@ function App() {
             <div><span className="section-kicker">{t("generationForecast")}</span><h2>{t("normalizedPower")}</h2>
               <p>{t("next48")}</p></div>
             <div className="turbine-tabs" role="tablist" aria-label={t("selectTurbine")}>
-              {Object.entries(turbines).map(([id, turbine]) =>
+              {context.turbines.map((site) => { const id = site.turbine_id; const turbine = turbines[id]; return (
                 <button key={id} role="tab" aria-selected={activeTurbine === id}
                   className={activeTurbine === id ? "active" : ""} onClick={() => setActiveTurbine(id)}>
                   <span className="turbine-swatch" style={{ background: turbine.color }} />
-                  <span>{t(turbine.labelKey)}<small>{turbine.dataset}</small></span>
+                  <span>{t(turbine.labelKey)}<small>{site.dataset_id}</small></span>
                 </button>
-              )}
+              ); })}
             </div>
           </div>
 
@@ -354,7 +334,7 @@ function App() {
                 <div><span>{t("availableHours")}</span><strong>{numericRows.length} <em>/ {HORIZON_HOURS}</em></strong></div>
               </div>
             </>
-          ) : <EmptyForecast status={status} turbineLabel={turbineLabel} errors={errors} t={t} />}
+          ) : <EmptyForecast status={turbineStatus} turbineLabel={turbineLabel} errors={turbineErrors} t={t} />}
         </article>
 
         <aside className="evidence-column">
@@ -372,8 +352,12 @@ function App() {
               })}
             </ol>
             <div className="agent-decision"><span>{t("recalculation")}</span><strong>
-              {t(revisionRows.length ? "revisionAvailable" : status === "running" ? "pendingAnalysis" : "noRevisionRecorded")}
+              {decisions.find((item) => item.action === "recalculate") ? t("revisionAvailable") :
+                decisions.find((item) => item.action === "reuse_unchanged_calculation") ? t("unchangedInputs") :
+                t(status === "running" ? "pendingAnalysis" : "noRevisionRecorded")}
             </strong></div>
+            {decisions.length > 0 && <details className="decision-details"><summary>{t("agentDecisions")}</summary>
+              {decisions.map((item, index) => <p key={index}><code>{item.action}</code> {item.reason || ""}</p>)}</details>}
           </article>
 
           <article className="panel evidence-panel">
@@ -381,21 +365,28 @@ function App() {
             {weather ? <>
               <dl className="evidence-list">
                 <div><dt>{t("provider")}</dt><dd>{weather.provider}</dd></div>
-                <div><dt>{t("model")}</dt><dd>{weather.source_model}</dd></div>
+                <div><dt>{t("model")}</dt><dd>{weather.model}</dd></div>
                 <div><dt>{t("modelRun")}</dt><dd>{formatTime(weather.run_at_utc, "UTC", locale)} UTC</dd></div>
+                <div><dt>{t("availabilityMethod")}</dt><dd>{weather.availability_method || t("notSupplied")}</dd></div>
+                <div><dt>{t("availabilityBound")}</dt><dd>{formatTime(weather.available_by_utc, "UTC", locale)} UTC</dd></div>
+                <div><dt>{t("runOrigin")}</dt><dd>{formatTime(weather.origin_utc, "UTC", locale)} UTC</dd></div>
+                <div><dt>{t("weatherCoverage")}</dt><dd>{formatTime(weather.coverage_start_utc, "UTC", locale)} — {formatTime(weather.coverage_end_utc, "UTC", locale)} UTC</dd></div>
+                <div><dt>{t("selectionReason")}</dt><dd>{weather.selection_reason || t("notSupplied")}</dd></div>
                 <div><dt>{t("retrieved")}</dt><dd>{formatTime(weather.retrieved_at_utc, "UTC", locale)} UTC</dd></div>
                 <div><dt>{t("variables")}</dt><dd>{weather.variables?.map((variable) =>
-                  `${variable.name} · ${variable.unit}`).join(" / ") || "—"}</dd></div>
+                  `${variable} · ${weather.hourly_units?.[variable] || "—"}`).join(" / ") || "—"}</dd></div>
                 <div><dt>{t("requestedSite")}</dt><dd>{requestedSite
                   ? `${formattedNumber(requestedSite.latitude, 6)}, ${formattedNumber(requestedSite.longitude, 6)}` : t("notSupplied")}</dd></div>
-                <div><dt>{t("gridPoint")}</dt><dd>{weather.provider_grid
-                  ? `${formattedNumber(weather.provider_grid.latitude, 4)}, ${formattedNumber(weather.provider_grid.longitude, 4)}` : "—"}</dd></div>
+                <div><dt>{t("gridPoint")}</dt><dd>{weather.provider_grid_coordinate
+                  ? `${formattedNumber(weather.provider_grid_coordinate.latitude, 4)}, ${formattedNumber(weather.provider_grid_coordinate.longitude, 4)}` : "—"}</dd></div>
               </dl>
-              <div className="provenance-foot"><span>{t("rawResponseHash")}</span><code title={weather.raw_response_sha256}>
-                {weather.raw_response_sha256 ? `${weather.raw_response_sha256.slice(0, 18)}…` : t("notSupplied")}</code></div>
+              <div className="provenance-foot"><span>{t("rawResponseHash")}</span><code title={weather.raw_sha256}>
+                {weather.raw_sha256 ? `${weather.raw_sha256.slice(0, 18)}…` : t("notSupplied")}</code></div>
               {!weather.availability_evidence && <div className="evidence-caution">{t("availabilityMissing")}</div>}
               {weather.source_reference?.startsWith("https://") && <a className="source-link" href={weather.source_reference}
                 target="_blank" rel="noreferrer">{t("viewWeatherSource")}</a>}
+              {weather.availability_evidence?.source_urls?.filter((url) => url.startsWith("https://")).map((url) =>
+                <a key={url} className="source-link" href={url} target="_blank" rel="noreferrer">{url.includes("ecmwf") ? "ECMWF" : "Open-Meteo"} · {t("availabilityMethod")} ↗</a>)}
             </> : <p className="empty-copy">{t("noWeatherSnapshot")}</p>}
           </article>
 
@@ -403,8 +394,8 @@ function App() {
             <div className="panel-head"><div><span className="section-kicker">{t("reviewNotes")}</span><h2>{t("warningsAssumptions")}</h2></div>
               <span className="count-badge">{warningList.length + errors.length}</span></div>
             <div className="warning-list">
-              {[...errors, ...warningList].length ? [...errors, ...warningList].map((item) =>
-                <div key={item.code} className="warning-row"><span className={`warning-mark ${item.severity || "error"}`} />
+              {[...errors, ...warningList].length ? [...errors, ...warningList].map((item, index) =>
+                <div key={`${item.code}-${index}`} className="warning-row"><span className={`warning-mark ${item.severity || "error"}`} />
                   <span><strong title={item.code}>{localizedWarning(item, t).title}</strong><small>{localizedWarning(item, t).message}</small></span></div>
               ) : <p className="empty-copy">{t("noWarnings")}</p>}
             </div>
@@ -424,8 +415,8 @@ function App() {
                   <tr key={`${item.origin_at}-${item.turbine_id}-${item.valid_start}`}>
                     <td><strong>{formatTime(item.valid_start, timeZone, locale)}</strong><small>{timeZone}</small></td>
                     <td>+{String(item.lead_hours).padStart(2, "0")} h</td>
-                    <td><span className="table-bar" style={{ width: `${Math.max(0, Math.min(100, item.power_normalized * 100))}%`,
-                      background: turbines[activeTurbine].color }} /><strong>{formattedNumber(item.power_normalized)}</strong></td>
+                    <td>{Number.isFinite(item.power_normalized) && <span className="table-bar" style={{ width: `${item.power_normalized * 100}%`,
+                      background: turbines[activeTurbine].color }} />}<strong>{formattedNumber(item.power_normalized)}</strong></td>
                     <td><span className={`quality-tag ${item.quality_flags?.length ? "flagged" : ""}`}>
                       {item.quality_flags?.length ? item.quality_flags.map((flag) => flag === "high-output-period" ? t("qualityHighOutput") : flag).join(", ") : t("noFlags")}</span></td>
                   </tr>
@@ -437,6 +428,12 @@ function App() {
         </article>
 
         <aside className="details-column">
+          <article className="panel detail-panel" aria-label={t("farmAggregate")}>
+            <div className="panel-head"><div><span className="section-kicker">{t("farmAggregate")}</span>
+              <h2>{Number.isFinite(data.farm_aggregate) ? formattedNumber(data.farm_aggregate) : t("aggregateUnavailable")}</h2></div></div>
+            {!Number.isFinite(data.farm_aggregate) && <p className="detail-copy">{data.farm_aggregate_reason?.message || (currentData ? t("notSupplied") : t("emptyIdleDesc"))}
+              {data.farm_aggregate_reason?.code && <><br /><code>{data.farm_aggregate_reason.code}</code></>}</p>}
+          </article>
           <article className="panel detail-panel">
             <div className="panel-head"><div><span className="section-kicker">{t("runMetadata")}</span><h2>{t("modelSource")}</h2></div></div>
             <dl className="evidence-list">
@@ -461,3 +458,8 @@ function App() {
 }
 
 export default App;
+
+function App() {
+  const controller = useForecast();
+  return <ForecastDashboard controller={controller} />;
+}
