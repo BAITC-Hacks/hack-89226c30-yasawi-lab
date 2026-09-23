@@ -1,0 +1,463 @@
+import { useEffect, useMemo, useState } from "react";
+import { getForecastRun } from "./api/forecast.js";
+import { knownSteps, knownWarnings, languageOptions, translate } from "./i18n.js";
+
+const HORIZON_HOURS = 48;
+const DEFAULT_TIMEZONE = "Asia/Almaty";
+const turbines = {
+  turbine_1: { labelKey: "turbine1", dataset: "dataset_1.csv", color: "#147d73" },
+  turbine_2: { labelKey: "turbine2", dataset: "dataset_2.csv", color: "#bd7448" },
+};
+
+const statusDetails = {
+  queued: { tone: "neutral" }, running: { tone: "blue" }, completed: { tone: "green" },
+  partial: { tone: "amber" }, blocked: { tone: "amber" }, failed: { tone: "red" },
+};
+
+function formatTime(value, timeZone = DEFAULT_TIMEZONE, locale = "en-GB", options = {}) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      timeZone,
+      day: "2-digit",
+      month: locale === "kk-KZ" ? "2-digit" : "short",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+      ...options,
+    }).format(date);
+  } catch {
+    return "—";
+  }
+}
+
+function formatDate(value, timeZone = DEFAULT_TIMEZONE, locale = "en-GB") {
+  return formatTime(value, timeZone, locale, { year: "numeric", hour: undefined, minute: undefined });
+}
+
+function formatHour(value, timeZone = DEFAULT_TIMEZONE, locale = "en-GB") {
+  return formatTime(value, timeZone, locale, { day: undefined, month: undefined });
+}
+
+function formattedNumber(value, digits = 2) {
+  return Number.isFinite(value) ? value.toFixed(digits) : "—";
+}
+
+function StatusIcon({ status }) {
+  if (status === "completed" || status === "ok") {
+    return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.5 10 3.5 3.5 7.5-7.5" /></svg>;
+  }
+  if (status === "running" || status === "queued") {
+    return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="M10 6v4l2.5 1.5" /></svg>;
+  }
+  if (status === "failed") {
+    return <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7" /><path d="m7.5 7.5 5 5m0-5-5 5" /></svg>;
+  }
+  return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5 18 17H2L10 2.5Z" /><path d="M10 7v4.5m0 2.5h.01" /></svg>;
+}
+
+function StatusPill({ status, t }) {
+  const item = statusDetails[status] || statusDetails.failed;
+  return <span className={`status-pill ${item.tone}`}><span className="status-dot" />{t(`status${status[0].toUpperCase()}${status.slice(1)}`)}</span>;
+}
+
+function LanguageSwitch({ language, onChange, t }) {
+  return <div className="language-switch" role="group" aria-label={t("language")}>
+    {languageOptions.map((option) => <button key={option.code} type="button" lang={option.code}
+      className={language === option.code ? "active" : ""} aria-pressed={language === option.code}
+      aria-label={`${t("language")}: ${option.label}`} onClick={() => onChange(option.code)}>{option.label}</button>)}
+  </div>;
+}
+
+function localizedWarning(item, t) {
+  const keys = knownWarnings[item.code];
+  return keys ? { title: t(keys[0]), message: t(keys[1]) } : {
+    title: item.code?.replaceAll("_", " ") || "—", message: item.message,
+  };
+}
+
+function displaySteps(data, status) {
+  const source = data.agent?.steps || [];
+  if (!data.is_mock || status === "completed") return source;
+  return source.map((step, index) => {
+    if (status === "running" || status === "queued") {
+      return { ...step, status: index === 0 ? "completed" : index === 1 && status === "running" ? "running" : "queued" };
+    }
+    if (status === "partial") {
+      return { ...step, status: index < source.length - 1 ? "completed" : "partial" };
+    }
+    return { ...step, status: index === 0 ? "completed" : index === 1 ? status : "queued" };
+  });
+}
+
+function ForecastChart({ activeSeries, comparisonSeries, activeTurbine, timeZone, locale, t }) {
+  const [hoverLead, setHoverLead] = useState(1);
+  const width = 900;
+  const height = 352;
+  const plot = { left: 53, right: 20, top: 22, bottom: 52 };
+  const innerWidth = width - plot.left - plot.right;
+  const innerHeight = height - plot.top - plot.bottom;
+  const validActive = activeSeries.filter((item) => Number.isFinite(item.power_normalized));
+  const validComparison = comparisonSeries.filter((item) => Number.isFinite(item.power_normalized));
+  const allValues = [...validActive, ...validComparison].map((item) => item.power_normalized);
+  const axisMax = Math.max(1, Math.ceil(Math.max(...allValues, 0) * 4) / 4);
+  const x = (lead) => plot.left + ((lead - 1) / (HORIZON_HOURS - 1)) * innerWidth;
+  const y = (value) => plot.top + (1 - value / axisMax) * innerHeight;
+  const line = (series) => series.map((item, index) =>
+    `${index === 0 || item.lead_hours !== series[index - 1].lead_hours + 1 ? "M" : "L"}${x(item.lead_hours)},${y(item.power_normalized)}`
+  ).join(" ");
+  const contiguous = validActive.every((item, index) => index === 0 || item.lead_hours === validActive[index - 1].lead_hours + 1);
+  const area = validActive.length && contiguous
+    ? `${line(validActive)} L${x(validActive.at(-1).lead_hours)},${y(0)} L${x(validActive[0].lead_hours)},${y(0)} Z`
+    : "";
+  const active = validActive.find((item) => item.lead_hours === hoverLead) || validActive[0];
+  const compared = validComparison.find((item) => item.valid_start === active?.valid_start);
+  const xLabels = [1, 13, 25, 37, 48];
+  const moveToPointer = (event) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const position = ((event.clientX - bounds.left) / bounds.width) * width;
+    const lead = Math.round(((position - plot.left) / innerWidth) * (HORIZON_HOURS - 1)) + 1;
+    setHoverLead(Math.max(1, Math.min(HORIZON_HOURS, lead)));
+  };
+
+  return (
+    <div className="chart-visual" tabIndex={0} aria-label={t("chartAria")}
+      onKeyDown={(event) => {
+        if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+          event.preventDefault();
+          setHoverLead((lead) => Math.max(1, Math.min(HORIZON_HOURS, lead + (event.key === "ArrowRight" ? 1 : -1))));
+        }
+      }}>
+      <span className="chart-mobile-hint">{t("chartMobileHint")}</span>
+      <div className="chart-scroll"><svg viewBox={`0 0 ${width} ${height}`} role="img"
+        aria-label={t("chartImageAria", { turbine: t(turbines[activeTurbine].labelKey) })}
+        onPointerMove={moveToPointer} onPointerDown={moveToPointer}>
+        <defs>
+          <linearGradient id="forecast-fill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={turbines[activeTurbine].color} stopOpacity=".14" />
+            <stop offset="100%" stopColor={turbines[activeTurbine].color} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {[0, 0.25, 0.5, 0.75, 1].map((fraction) => (
+          <g key={fraction}>
+            <line className="chart-grid-line" x1={plot.left} x2={width - plot.right} y1={y(fraction * axisMax)} y2={y(fraction * axisMax)} />
+            <text className="chart-axis-label" x={plot.left - 13} y={y(fraction * axisMax) + 4} textAnchor="end">{formattedNumber(fraction * axisMax)}</text>
+          </g>
+        ))}
+        <line className="chart-day-divider" x1={x(25)} x2={x(25)} y1={plot.top} y2={y(0)} />
+        <text className="chart-day-label" x={x(25) + 10} y={plot.top + 15}>{t("day2")}</text>
+        {xLabels.map((lead) => {
+          const row = validActive.find((item) => item.lead_hours === lead);
+          return row ? <text key={lead} className="chart-axis-label" x={x(lead)} y={height - 17}
+            textAnchor={lead === 1 ? "start" : lead === 48 ? "end" : "middle"}>{formatTime(row.valid_start, timeZone, locale)}</text> : null;
+        })}
+        {area && <path d={area} fill="url(#forecast-fill)" />}
+        {validComparison.length > 0 && <path className="chart-comparison-line" d={line(validComparison)} />}
+        <path className="chart-primary-line" d={line(validActive)} stroke={turbines[activeTurbine].color} />
+        {active && (
+          <g>
+            <line className="chart-cursor-line" x1={x(active.lead_hours)} x2={x(active.lead_hours)} y1={plot.top} y2={y(0)} />
+            <circle className="chart-cursor-halo" cx={x(active.lead_hours)} cy={y(active.power_normalized)} r="9" fill={turbines[activeTurbine].color} />
+            <circle className="chart-cursor-dot" cx={x(active.lead_hours)} cy={y(active.power_normalized)} r="5" fill={turbines[activeTurbine].color} />
+          </g>
+        )}
+        <rect x={plot.left} y={plot.top} width={innerWidth} height={innerHeight} fill="transparent" />
+      </svg></div>
+      <div className="chart-inspector" aria-live="polite">
+        <span>{active ? formatTime(active.valid_start, timeZone, locale) : t("noForecastHour")} <small>· {t("leadPlus", { lead: active?.lead_hours ?? "—" })}</small></span>
+        <strong>{formattedNumber(active?.power_normalized)} <small>{t("normalizedPowerShort")}</small></strong>
+        {compared && <span className="comparison-readout">{t("otherTurbine")} {formattedNumber(compared.power_normalized)}</span>}
+      </div>
+    </div>
+  );
+}
+
+function EmptyForecast({ status, turbineLabel, errors = [], action = null, t }) {
+  const key = status[0].toUpperCase() + status.slice(1);
+  const title = t(`empty${key}Title`);
+  const description = t(`empty${key}Desc`, { turbine: turbineLabel });
+  const errorMessage = errors[0] ? localizedWarning(errors[0], t).message : null;
+  return (
+    <div className={`forecast-empty ${status}`} role="status">
+      <span className="empty-icon"><StatusIcon status={status} /></span>
+      <h3>{title}</h3>
+      <p>{errorMessage || description}</p>
+      {errors[0]?.code && <code>{errors[0].code}</code>}
+      {action}
+    </div>
+  );
+}
+
+function App() {
+  const [data, setData] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const [activeTurbine, setActiveTurbine] = useState("turbine_1");
+  const [previewStatus, setPreviewStatus] = useState("completed");
+  const [language, setLanguage] = useState(() => {
+    try {
+      const saved = window.localStorage.getItem("wind-replay-language");
+      return languageOptions.some((option) => option.code === saved) ? saved : "ru";
+    } catch {
+      return "ru";
+    }
+  });
+  const locale = languageOptions.find((option) => option.code === language)?.locale || "ru-RU";
+  const t = (key, values) => translate(language, key, values);
+
+  useEffect(() => {
+    document.documentElement.lang = language;
+    try { window.localStorage.setItem("wind-replay-language", language); } catch { /* Storage may be unavailable. */ }
+  }, [language]);
+
+  useEffect(() => {
+    let disposed = false;
+    let timer;
+    async function load() {
+      try {
+        const result = await getForecastRun();
+        if (disposed) return;
+        setData(result);
+        setLoadError(null);
+        if (!result.is_mock && ["queued", "running"].includes(result.status)) {
+          timer = window.setTimeout(load, 3000);
+        }
+      } catch (error) {
+        if (!disposed) setLoadError(error.message);
+      }
+    }
+    load();
+    return () => { disposed = true; window.clearTimeout(timer); };
+  }, []);
+
+  const originAt = data?.forecasts?.[0]?.origin_at || data?.origin_at || null;
+  const timeZone = data?.weather_snapshots?.[0]?.project_timezone || DEFAULT_TIMEZONE;
+  const status = data?.is_mock ? previewStatus : data?.status === "error" ? "failed" : data?.status || "queued";
+  const originRows = useMemo(() =>
+    (data?.forecasts || []).filter((row) => row.origin_at === originAt),
+    [data, originAt]
+  );
+  const visibleRows = status === "completed" || status === "partial"
+    ? data?.is_mock && status === "partial"
+      ? originRows.filter((row) => row.turbine_id === "turbine_1")
+      : originRows
+    : [];
+  const series = {
+    turbine_1: visibleRows.filter((row) => row.turbine_id === "turbine_1").sort((a, b) => a.lead_hours - b.lead_hours),
+    turbine_2: visibleRows.filter((row) => row.turbine_id === "turbine_2").sort((a, b) => a.lead_hours - b.lead_hours),
+  };
+  const activeSeries = series[activeTurbine];
+  const comparisonSeries = series[activeTurbine === "turbine_1" ? "turbine_2" : "turbine_1"];
+  const numericRows = activeSeries.filter((row) => Number.isFinite(row.power_normalized));
+  const values = numericRows.map((row) => row.power_normalized);
+  const mean = values.length ? values.reduce((total, value) => total + value, 0) / values.length : null;
+  const peak = values.length ? Math.max(...values) : null;
+  const peakRow = peak === null ? null : numericRows.find((row) => row.power_normalized === peak);
+  const totalCoverage = visibleRows.filter((row) => Number.isFinite(row.power_normalized)).length;
+  const weatherId = activeSeries[0]?.weather_snapshot_id;
+  const weather = data?.weather_snapshots?.find((snapshot) => snapshot.weather_snapshot_id === weatherId)
+    || data?.weather_snapshots?.[0];
+  const requestedSite = weather?.requested_coordinates?.find((site) => site.turbine_id === activeTurbine);
+  const steps = data ? displaySteps(data, status) : [];
+  const warningList = data?.warnings || [];
+  const errors = data?.errors || [];
+  const revisionRows = activeSeries.filter((row) => Number.isFinite(row.revision_delta));
+  const firstRevision = revisionRows[0];
+  const turbineLabel = t(turbines[activeTurbine].labelKey);
+
+  if (loadError) {
+    return <main className="app-shell"><header className="topbar"><strong className="brand-name">Wind Replay</strong><div className="topbar-right"><StatusPill status="failed" t={t} /><LanguageSwitch language={language} onChange={setLanguage} t={t} /></div></header>
+      <div className="load-failure"><EmptyForecast status="failed" turbineLabel={turbineLabel} t={t}
+        errors={[{ code: "API_UNAVAILABLE", message: loadError }]}
+        action={<button className="retry-button" onClick={() => window.location.reload()}>{t("retryLoading")}</button>} /></div></main>;
+  }
+  if (!data) {
+    return <main className="app-shell"><header className="topbar"><strong className="brand-name">Wind Replay</strong><div className="topbar-right"><StatusPill status="running" t={t} /><LanguageSwitch language={language} onChange={setLanguage} t={t} /></div></header>
+      <div className="initial-loading" role="status"><span className="loading-spinner" /><strong>{t("loadingTitle")}</strong><p>{t("loadingDescription")}</p></div></main>;
+  }
+
+  return (
+    <main className="app-shell" id="top">
+      <header className="topbar">
+        <a className="brand" href="#top" aria-label={t("brandHome")}><span className="brand-symbol"><i /><i /><i /></span>
+          <span><strong className="brand-name">Wind Replay</strong><small>{t("brandSubtitle")}</small></span></a>
+        <div className="topbar-right">
+          <span className="topbar-origin"><small>{t("replayOrigin")}</small><strong>{formatDate(originAt, timeZone, locale)} <span>{formatHour(originAt, timeZone, locale)}</span></strong></span>
+          <StatusPill status={status} t={t} />
+          <LanguageSwitch language={language} onChange={setLanguage} t={t} />
+        </div>
+      </header>
+
+      <section className="page-intro">
+        <div>
+          <div className="overline"><span className="overline-rule" />HACKALEM AI · ENERGY TRACK 01</div>
+          <h1>{t("heading")}</h1>
+          <p>{t("intro")}</p>
+          <div className="mobile-origin"><span>{t("replayOrigin")}</span><strong>{formatDate(originAt, timeZone, locale)} · {formatHour(originAt, timeZone, locale)} {timeZone}</strong></div>
+        </div>
+        <div className="run-context">
+          <span>{t("runId")} <code>{data.run_id}</code></span>
+          {data.is_mock && <span className="mock-badge">{t("mockBadge")}</span>}
+        </div>
+      </section>
+
+      {data.is_mock && (
+        <div className="preview-bar">
+          <span>{t("previewStatus")} <small>{t("mockOnly")}</small></span>
+          <div className="preview-controls" aria-label={t("previewAria")}>
+            {["running", "completed", "partial", "blocked", "failed"].map((item) =>
+              <button key={item} className={status === item ? "active" : ""} aria-pressed={status === item}
+                onClick={() => setPreviewStatus(item)}>{t(`status${item[0].toUpperCase()}${item.slice(1)}`)}</button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <section className="kpi-strip" aria-label={t("overviewAria")}>
+        <div className="kpi"><span>{t("forecastHorizon")}</span><strong>48 <small>{t("hours")}</small></strong><p>{t("hourlyIntervals")}</p></div>
+        <div className="kpi"><span>{t("turbines")}</span><strong>02 <small>{t("units")}</small></strong><p>{t("separateSeries")}</p></div>
+        <div className="kpi"><span>{t(status === "blocked" ? "candidateWeatherRun" : "weatherRun")}</span>
+          <strong className="kpi-date">{weather ? formatTime(weather.run_at_utc, "UTC", locale) : "—"} <small>UTC</small></strong>
+          <p>{weather?.source_model || t("noRunRecorded")}</p></div>
+        <div className="kpi"><span>{t("dataCoverage")}</span><strong>{totalCoverage} <small>/ {HORIZON_HOURS * 2} {t("hours")}</small></strong>
+          <p>{t("rowsWithForecasts")}</p></div>
+      </section>
+
+      <section className="dashboard-grid">
+        <article className="forecast-panel panel">
+          <div className="panel-head chart-head">
+            <div><span className="section-kicker">{t("generationForecast")}</span><h2>{t("normalizedPower")}</h2>
+              <p>{t("next48")}</p></div>
+            <div className="turbine-tabs" role="tablist" aria-label={t("selectTurbine")}>
+              {Object.entries(turbines).map(([id, turbine]) =>
+                <button key={id} role="tab" aria-selected={activeTurbine === id}
+                  className={activeTurbine === id ? "active" : ""} onClick={() => setActiveTurbine(id)}>
+                  <span className="turbine-swatch" style={{ background: turbine.color }} />
+                  <span>{t(turbine.labelKey)}<small>{turbine.dataset}</small></span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {status === "partial" && <div className="inline-notice amber"><StatusIcon status="partial" />
+            <span>{t("partialNotice")}</span></div>}
+          {numericRows.length ? (
+            <>
+              <div className="chart-legend"><span><i style={{ background: turbines[activeTurbine].color }} />{turbineLabel}</span>
+                {comparisonSeries.length > 0 && <span className="muted"><i />{t("otherTurbine")}</span>}</div>
+              <ForecastChart activeSeries={activeSeries} comparisonSeries={comparisonSeries}
+                activeTurbine={activeTurbine} timeZone={timeZone} locale={locale} t={t} />
+              <div className="chart-summary">
+                <div><span>{t("average")}</span><strong>{formattedNumber(mean)}</strong></div>
+                <div><span>{t("peak")}</span><strong>{formattedNumber(peak)}</strong><small>{peakRow ? formatTime(peakRow.valid_start, timeZone, locale) : "—"}</small></div>
+                <div><span>{t("availableHours")}</span><strong>{numericRows.length} <em>/ {HORIZON_HOURS}</em></strong></div>
+              </div>
+            </>
+          ) : <EmptyForecast status={status} turbineLabel={turbineLabel} errors={errors} t={t} />}
+        </article>
+
+        <aside className="evidence-column">
+          <article className="panel agent-panel">
+            <div className="panel-head"><div><span className="section-kicker">{t("autonomousWorkflow")}</span><h2>{t("agentExecution")}</h2></div></div>
+            <p className="agent-description">{t(`desc${(statusDetails[status] ? status : "failed")[0].toUpperCase()}${(statusDetails[status] ? status : "failed").slice(1)}`)}</p>
+            <ol className="agent-steps">
+              {steps.map((step, index) => {
+                const stepStatus = step.status === "error" ? "failed" : step.status === "not started" ? "queued" : step.status;
+                return <li key={`${step.name}-${index}`} className={`step-${stepStatus}`}>
+                  <span className="step-icon"><StatusIcon status={stepStatus} /></span>
+                  <span><strong>{knownSteps[step.name] ? t(knownSteps[step.name]) : step.name}</strong>
+                    <small>{t(`status${stepStatus[0].toUpperCase()}${stepStatus.slice(1)}`)}</small></span>
+                </li>;
+              })}
+            </ol>
+            <div className="agent-decision"><span>{t("recalculation")}</span><strong>
+              {t(revisionRows.length ? "revisionAvailable" : status === "running" ? "pendingAnalysis" : "noRevisionRecorded")}
+            </strong></div>
+          </article>
+
+          <article className="panel evidence-panel">
+            <div className="panel-head"><div><span className="section-kicker">{t("weatherEvidence")}</span><h2>{t("forecastProvenance")}</h2></div></div>
+            {weather ? <>
+              <dl className="evidence-list">
+                <div><dt>{t("provider")}</dt><dd>{weather.provider}</dd></div>
+                <div><dt>{t("model")}</dt><dd>{weather.source_model}</dd></div>
+                <div><dt>{t("modelRun")}</dt><dd>{formatTime(weather.run_at_utc, "UTC", locale)} UTC</dd></div>
+                <div><dt>{t("retrieved")}</dt><dd>{formatTime(weather.retrieved_at_utc, "UTC", locale)} UTC</dd></div>
+                <div><dt>{t("variables")}</dt><dd>{weather.variables?.map((variable) =>
+                  `${variable.name} · ${variable.unit}`).join(" / ") || "—"}</dd></div>
+                <div><dt>{t("requestedSite")}</dt><dd>{requestedSite
+                  ? `${formattedNumber(requestedSite.latitude, 6)}, ${formattedNumber(requestedSite.longitude, 6)}` : t("notSupplied")}</dd></div>
+                <div><dt>{t("gridPoint")}</dt><dd>{weather.provider_grid
+                  ? `${formattedNumber(weather.provider_grid.latitude, 4)}, ${formattedNumber(weather.provider_grid.longitude, 4)}` : "—"}</dd></div>
+              </dl>
+              <div className="provenance-foot"><span>{t("rawResponseHash")}</span><code title={weather.raw_response_sha256}>
+                {weather.raw_response_sha256 ? `${weather.raw_response_sha256.slice(0, 18)}…` : t("notSupplied")}</code></div>
+              {!weather.availability_evidence && <div className="evidence-caution">{t("availabilityMissing")}</div>}
+              {weather.source_reference?.startsWith("https://") && <a className="source-link" href={weather.source_reference}
+                target="_blank" rel="noreferrer">{t("viewWeatherSource")}</a>}
+            </> : <p className="empty-copy">{t("noWeatherSnapshot")}</p>}
+          </article>
+
+          <article className="panel warnings-panel">
+            <div className="panel-head"><div><span className="section-kicker">{t("reviewNotes")}</span><h2>{t("warningsAssumptions")}</h2></div>
+              <span className="count-badge">{warningList.length + errors.length}</span></div>
+            <div className="warning-list">
+              {[...errors, ...warningList].length ? [...errors, ...warningList].map((item) =>
+                <div key={item.code} className="warning-row"><span className={`warning-mark ${item.severity || "error"}`} />
+                  <span><strong title={item.code}>{localizedWarning(item, t).title}</strong><small>{localizedWarning(item, t).message}</small></span></div>
+              ) : <p className="empty-copy">{t("noWarnings")}</p>}
+            </div>
+          </article>
+        </aside>
+      </section>
+
+      <section className="bottom-grid">
+        <article className="panel table-panel">
+          <div className="panel-head"><div><span className="section-kicker">{t("hourlyOutput")}</span><h2>{t("turbineForecast", { turbine: turbineLabel })}</h2></div>
+            <span className="table-count">{t("countHours", { count: numericRows.length, total: HORIZON_HOURS })}</span></div>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>{t("localTime")}</th><th>{t("lead")}</th><th>{t("normalizedPower")}</th><th>{t("quality")}</th></tr></thead>
+              <tbody>
+                {activeSeries.map((item) =>
+                  <tr key={`${item.origin_at}-${item.turbine_id}-${item.valid_start}`}>
+                    <td><strong>{formatTime(item.valid_start, timeZone, locale)}</strong><small>{timeZone}</small></td>
+                    <td>+{String(item.lead_hours).padStart(2, "0")} h</td>
+                    <td><span className="table-bar" style={{ width: `${Math.max(0, Math.min(100, item.power_normalized * 100))}%`,
+                      background: turbines[activeTurbine].color }} /><strong>{formattedNumber(item.power_normalized)}</strong></td>
+                    <td><span className={`quality-tag ${item.quality_flags?.length ? "flagged" : ""}`}>
+                      {item.quality_flags?.length ? item.quality_flags.map((flag) => flag === "high-output-period" ? t("qualityHighOutput") : flag).join(", ") : t("noFlags")}</span></td>
+                  </tr>
+                )}
+                {!activeSeries.length && <tr><td colSpan={4} className="no-rows">{t("noRows")}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <aside className="details-column">
+          <article className="panel detail-panel">
+            <div className="panel-head"><div><span className="section-kicker">{t("runMetadata")}</span><h2>{t("modelSource")}</h2></div></div>
+            <dl className="evidence-list">
+              <div><dt>{t("forecastModel")}</dt><dd>{activeSeries[0]?.model_version || t("notAvailable")}</dd></div>
+              <div><dt>{t("weatherSource")}</dt><dd>{weather?.provider || t("notAvailable")}</dd></div>
+              <div><dt>{t("runOrigin")}</dt><dd>{formatTime(originAt, timeZone, locale)} {timeZone}</dd></div>
+              <div><dt>{t("outputUnit")}</dt><dd>{t("normalizedPower")}</dd></div>
+            </dl>
+          </article>
+          <article className="panel detail-panel">
+            <div className="panel-head"><div><span className="section-kicker">{t("overlappingForecasts")}</span><h2>{t("revisionComparison")}</h2></div></div>
+            {firstRevision ? <p className="detail-copy">{t("revisionSentence", { time: formatTime(firstRevision.valid_start, timeZone, locale),
+              delta: formattedNumber(firstRevision.revision_delta), run: firstRevision.previous_run_id })}</p>
+              : <p className="detail-copy">{t("noPreviousRevision")}</p>}
+          </article>
+        </aside>
+      </section>
+
+      <footer><span>WIND REPLAY · HACKALEM AI 2026</span><span>{t("footerNote")}</span></footer>
+    </main>
+  );
+}
+
+export default App;
