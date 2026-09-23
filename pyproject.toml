@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-wind-forecast"
+version = "0.1.0"
+description = "Reproducible agentic wind-farm generation forecasting for HackAlem AI"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "pandas>=2.0"]
+
+[project.scripts]
+wind-forecast = "agentic_forecast.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

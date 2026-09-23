@@ -1,0 +1,2 @@
+[console_scripts]
+wind-forecast = agentic_forecast.cli:main

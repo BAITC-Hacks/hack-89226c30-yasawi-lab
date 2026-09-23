@@ -1,0 +1,111 @@
+{
+  "created_at_utc": "2026-09-23T09:16:15.738489Z",
+  "cutoff": "2026-01-31T23:00:00",
+  "horizon_hours": 48,
+  "weather_source": "seasonal-persistence-fallback",
+  "model": "direct multi-horizon ridge models with time-based lags and wind power curve",
+  "no_lookahead": true,
+  "coordinates": [
+    [
+      43.64515,
+      78.535604
+    ],
+    [
+      43.643198,
+      78.538828
+    ]
+  ],
+  "training_rows": 25392,
+  "source_files": [
+    "D:\\HackAlem\\hack-89226c30-yasawi-lab\\assets\\Dataset HackAlemAI для участников 11.03.2023-28.02.2026 - turbine 1.csv",
+    "D:\\HackAlem\\hack-89226c30-yasawi-lab\\assets\\Dataset HackAlemAI для участников 11.03.2023-28.02.2026 - turbine 2.csv"
+  ],
+  "data_quality": {
+    "status": "warning",
+    "hourly_rows": 25392,
+    "expected_frequency": "1h",
+    "missing_power_rows": 1759,
+    "weather_interpolated_rows": 1759,
+    "time_span": [
+      "2023-03-11T00:00:00",
+      "2026-01-31T23:00:00"
+    ]
+  },
+  "training_samples_by_horizon": {
+    "1": 22247,
+    "2": 22214,
+    "3": 22188,
+    "4": 22164,
+    "5": 22142,
+    "6": 22126,
+    "7": 22116,
+    "8": 22109,
+    "9": 22102,
+    "10": 22096,
+    "11": 22090,
+    "12": 22085,
+    "13": 22079,
+    "14": 22074,
+    "15": 22069,
+    "16": 22065,
+    "17": 22060,
+    "18": 22055,
+    "19": 22050,
+    "20": 22045,
+    "21": 22040,
+    "22": 22035,
+    "23": 22029,
+    "24": 22024,
+    "25": 22020,
+    "26": 22015,
+    "27": 22012,
+    "28": 22010,
+    "29": 22009,
+    "30": 22008,
+    "31": 22005,
+    "32": 22002,
+    "33": 21999,
+    "34": 21996,
+    "35": 21992,
+    "36": 21990,
+    "37": 21988,
+    "38": 21987,
+    "39": 21984,
+    "40": 21980,
+    "41": 21976,
+    "42": 21973,
+    "43": 21973,
+    "44": 21972,
+    "45": 21968,
+    "46": 21965,
+    "47": 21963,
+    "48": 21961
+  },
+  "stages": [
+    {
+      "stage": "data_quality",
+      "problem_solved": "irregular hourly timestamps and silent gaps",
+      "status": "completed"
+    },
+    {
+      "stage": "weather_retrieval",
+      "problem_solved": "forecast-time weather provenance",
+      "status": "seasonal-persistence-fallback"
+    },
+    {
+      "stage": "feature_engineering",
+      "problem_solved": "row-based lags that were not real hours",
+      "status": "completed"
+    },
+    {
+      "stage": "forecasting",
+      "problem_solved": "recursive error accumulation across 48 hours",
+      "status": "completed"
+    },
+    {
+      "stage": "audit",
+      "problem_solved": "unverifiable forecast inputs and origins",
+      "status": "completed"
+    }
+  ]
+}
