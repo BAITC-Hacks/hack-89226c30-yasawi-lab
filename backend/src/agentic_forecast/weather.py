@@ -28,6 +28,7 @@ VARIABLES = ["wind_speed_100m", "temperature_2m"]
 # include ECMWF's later post-processed weather-parameter schedule.
 SCHEDULE_CLOCK_UTC = {0: (6, 55), 6: (12, 12), 12: (18, 55), 18: (0, 12)}
 SAFETY_MARGIN_MINUTES = 10
+PROVIDER_DELAY_MINUTES = 360
 
 
 class WeatherBlocked(ValueError):
@@ -81,14 +82,19 @@ def _evidence(settings: Settings, turbine_id: str, run: datetime) -> dict | None
     delivery = run.replace(hour=delivery_hour, minute=delivery_minute)
     if delivery <= run:
         delivery += timedelta(days=1)
-    processing_bound = run + timedelta(hours=6)
+    processing_bound = run + timedelta(minutes=PROVIDER_DELAY_MINUTES)
     base_bound = max(delivery, processing_bound)
     available_bound = base_bound + timedelta(minutes=SAFETY_MARGIN_MINUTES)
     return {"evidence_type": "conservative_schedule_delay_bound",
+            "availability_method": "schedule_bound", "model": "ECMWF IFS HRES 9km",
+            "provider": "Open-Meteo Single Runs", "cycle_time_utc": run.isoformat().replace("+00:00", "Z"),
             "available_by_utc": available_bound.isoformat().replace("+00:00", "Z"),
             "source_urls": [DISSEMINATION_URL, DOCUMENTATION_URL],
+            "schedule_source": DISSEMINATION_URL, "provider_delay_source": DOCUMENTATION_URL,
             "ecmwf_schedule_last_updated": "2025-07-02",
+            "nominal_release_utc": delivery.isoformat().replace("+00:00", "Z"),
             "delivery_bound_utc": delivery.isoformat().replace("+00:00", "Z"),
+            "documented_provider_delay_minutes": PROVIDER_DELAY_MINUTES,
             "open_meteo_processing_bound_utc": processing_bound.isoformat().replace("+00:00", "Z"),
             "safety_margin_minutes": SAFETY_MARGIN_MINUTES,
             "interpretation": "Conservative replay eligibility bound, not an observed Open-Meteo publication timestamp"}
@@ -103,7 +109,21 @@ def availability_verdict(run: datetime, origin: datetime, evidence: dict | None)
         return "unverified", "AVAILABILITY_UNVERIFIED", None
     if available.tzinfo is None:
         return "unverified", "AVAILABILITY_UNVERIFIED", None
-    if evidence.get("evidence_type") != "conservative_schedule_delay_bound":
+    if evidence.get("evidence_type") == "conservative_schedule_delay_bound":
+        try:
+            nominal = datetime.fromisoformat(evidence["nominal_release_utc"].replace("Z", "+00:00"))
+            cycle = datetime.fromisoformat(evidence["cycle_time_utc"].replace("Z", "+00:00"))
+            delay = evidence["documented_provider_delay_minutes"]
+            margin = evidence["safety_margin_minutes"]
+            if (nominal.tzinfo is None or cycle != run or
+                    evidence["schedule_source"] != DISSEMINATION_URL or
+                    evidence["provider_delay_source"] != DOCUMENTATION_URL or
+                    delay != PROVIDER_DELAY_MINUTES or margin != SAFETY_MARGIN_MINUTES or
+                    max(nominal, cycle + timedelta(minutes=delay)) + timedelta(minutes=margin) != available):
+                return "unverified", "AVAILABILITY_UNVERIFIED", None
+        except (KeyError, ValueError, TypeError, OverflowError):
+            return "unverified", "AVAILABILITY_UNVERIFIED", None
+    else:
         try:
             recorded = datetime.fromisoformat(evidence["recorded_at_utc"].replace("Z", "+00:00"))
         except (ValueError, KeyError):
@@ -166,11 +186,13 @@ def _fetch(url: str, timeout: float, retries: int) -> tuple[bytes, int, int]:
             with urllib.request.urlopen(url, timeout=timeout, context=ssl.create_default_context(cafile=certifi.where())) as response:
                 return response.read(), response.status, attempt
         except urllib.error.HTTPError as exc:
-            if exc.code not in (429, 500, 502, 503, 504):
+            if exc.code not in (408, 425, 429, 500, 502, 503, 504):
                 raise WeatherBlocked("WEATHER_RUN_NOT_ELIGIBLE", f"Provider rejected candidate run (HTTP {exc.code})") from exc
             last_error = exc
             if attempt < retries:
-                time.sleep(min(2 ** attempt, 2))
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                delay = float(retry_after) if retry_after and retry_after.isdecimal() else 2 ** attempt
+                time.sleep(min(delay, 2))
         except (urllib.error.URLError, TimeoutError) as exc:
             last_error = exc
             if attempt < retries:
@@ -178,19 +200,51 @@ def _fetch(url: str, timeout: float, retries: int) -> tuple[bytes, int, int]:
     raise WeatherUnavailable(f"Open-Meteo request failed after {retries + 1} attempts: {last_error}")
 
 
+def _selected_path(settings: Settings, turbine_id: str, origin: datetime, url: str) -> Path:
+    key = hashlib.sha256(f"{turbine_id}/{origin.astimezone(timezone.utc).isoformat()}/{url}".encode()).hexdigest()
+    return settings.artifacts_dir / "weather" / "selected" / f"{key}.json"
+
+
+def _frozen_snapshot(path: Path, settings: Settings, origin: datetime) -> WeatherSnapshot | None:
+    if not path.exists():
+        return None
+    try:
+        pointer = json.loads(path.read_text(encoding="utf-8"))
+        snapshot_id = pointer["weather_snapshot_id"]
+        folder = settings.artifacts_dir / "weather"
+        metadata = json.loads((folder / f"{snapshot_id}.manifest.json").read_text(encoding="utf-8"))
+        raw = (folder / f"{snapshot_id}.json").read_bytes()
+        if metadata["weather_snapshot_id"] != snapshot_id or hashlib.sha256(raw).hexdigest() != metadata["raw_sha256"]:
+            raise ValueError("frozen snapshot digest or identity mismatch")
+        run = datetime.fromisoformat(metadata["run_at_utc"].replace("Z", "+00:00"))
+        verdict, _, _ = availability_verdict(run, origin, metadata["availability_evidence"])
+        if verdict != "eligible":
+            raise ValueError("frozen snapshot availability is not eligible")
+        wind, temperature, selected, _ = validate_hourly(json.loads(raw), origin)
+        if selected != metadata["selected_valid_times_utc"]:
+            raise ValueError("frozen snapshot coverage mismatch")
+        return WeatherSnapshot({**metadata, "reused_snapshot": True}, wind, temperature)
+    except (OSError, KeyError, ValueError, TypeError, json.JSONDecodeError, WeatherBlocked) as exc:
+        raise WeatherUnavailable(f"Frozen historical weather snapshot is corrupt: {exc}") from exc
+
+
 def retrieve(settings: Settings, turbine_id: str, origin: datetime, run: datetime,
-             fetcher=None) -> WeatherSnapshot:
+             fetcher=None, selection_reason: str = "latest eligible cycle with full required coverage") -> WeatherSnapshot:
     latitude, longitude, coordinate_source = COORDINATES[turbine_id]
     params = {"latitude": latitude, "longitude": longitude, "run": run.strftime("%Y-%m-%dT%H:%M"),
               "models": MODEL_ID, "hourly": ",".join(VARIABLES), "timezone": "UTC",
               "wind_speed_unit": "ms", "forecast_hours": 96}
     url = f"{settings.weather_base_url}?{urllib.parse.urlencode(params)}"
+    selected_path = _selected_path(settings, turbine_id, origin, url)
+    frozen = _frozen_snapshot(selected_path, settings, origin)
+    if frozen is not None:
+        return frozen
     raw, status, retries_used = (fetcher or _fetch)(url, settings.provider_timeout_seconds, settings.provider_retries)
     retrieved_at = datetime.now(timezone.utc).isoformat()
     digest = hashlib.sha256(raw).hexdigest()
     evidence = _evidence(settings, turbine_id, run)
     evidence_digest = hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
-    snapshot_id = hashlib.sha256(f"{turbine_id}/{url}/{digest}/{evidence_digest}".encode()).hexdigest()[:20]
+    snapshot_id = hashlib.sha256(f"{turbine_id}/{origin.astimezone(timezone.utc).isoformat()}/{url}/{digest}/{evidence_digest}".encode()).hexdigest()[:20]
     raw_path = settings.artifacts_dir / "weather" / f"{snapshot_id}.json"
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     if not raw_path.exists():
@@ -203,13 +257,16 @@ def retrieve(settings: Settings, turbine_id: str, origin: datetime, run: datetim
             if os.path.exists(name):
                 os.unlink(name)
     verdict, reason, available = availability_verdict(run, origin, evidence)
-    metadata = {"weather_snapshot_id": snapshot_id, "provider": "Open-Meteo", "model": "ECMWF IFS HRES 9km",
+    metadata = {"weather_snapshot_id": snapshot_id, "turbine_id": turbine_id,
+                "provider": "Open-Meteo", "model": "ECMWF IFS HRES 9km",
                 "provider_model_id": MODEL_ID, "request_url": url, "request_parameters": params,
                 "http_status": status, "retrieved_at_utc": retrieved_at, "source_reference": DOCUMENTATION_URL,
                 "coordinate_source": coordinate_source, "requested_coordinate": {"latitude": latitude, "longitude": longitude},
                 "run_at_utc": run.isoformat().replace("+00:00", "Z"),
+                "availability_method": "schedule_bound" if evidence and evidence.get("evidence_type") == "conservative_schedule_delay_bound" else "exact_timestamp" if evidence else "unverified",
                 "available_by_utc": available.isoformat().replace("+00:00", "Z") if available else None,
                 "availability_evidence": evidence, "eligibility": verdict, "eligibility_reason": reason,
+                "selection_reason": selection_reason,
                 "origin_utc": origin.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
                 "variables": VARIABLES, "variable_heights_m": {"wind_speed_100m": 100, "temperature_2m": 2},
                 "raw_sha256": digest, "raw_path": str(raw_path), "retries_used": retries_used}
@@ -220,7 +277,10 @@ def retrieve(settings: Settings, turbine_id: str, origin: datetime, run: datetim
                         provider_timezone=payload.get("timezone"), provider_utc_offset_seconds=payload.get("utc_offset_seconds"),
                         hourly_units=payload.get("hourly_units"))
         wind, temperature, selected, checks = validate_hourly(payload, origin)
-        metadata.update(selected_valid_times_utc=selected, **checks)
+        metadata.update(selected_valid_times_utc=selected,
+                        coverage_start_utc=selected[0],
+                        coverage_end_utc=(datetime.fromisoformat(selected[-1].replace("Z", "+00:00")) + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+                        **checks)
     except (json.JSONDecodeError, WeatherBlocked) as exc:
         metadata.update(coverage_count=0, validation_error=str(exc))
         manifest_path = settings.artifacts_dir / "weather" / f"{snapshot_id}.manifest.json"
@@ -238,4 +298,7 @@ def retrieve(settings: Settings, turbine_id: str, origin: datetime, run: datetim
         raise WeatherBlocked(reason, "Weather run is not eligible at the forecast origin",
                              {"weather_snapshot_id": snapshot_id, "run_at_utc": metadata["run_at_utc"],
                               "availability_evidence": evidence})
+    if not selected_path.exists():
+        atomic_json(selected_path, {"weather_snapshot_id": snapshot_id, "request_url": url,
+                                    "origin_utc": origin.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")})
     return WeatherSnapshot(metadata, wind, temperature)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
@@ -10,8 +11,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import COORDINATES, CONFIGURATION_ID, Settings
-from .data import SourceQualityError, load_turbine
+from .config import COORDINATES, CONFIGURATION_ID, FIRST_ORIGIN, LAST_ORIGIN, Settings
+from .data import SourceQualityError, load_all, load_turbine
 from .model import atomic_json, fit_or_load, predict
 from .weather import WeatherBlocked, WeatherUnavailable, ordered_candidates, retrieve
 
@@ -31,11 +32,11 @@ def issue(code: str, message: str, severity: str = "error", details: dict | None
     return result
 
 
-def initial_result(run_id: str, origin: datetime) -> dict:
-    return {"schema_version": "1.0", "run_id": run_id, "status": "queued", "mode": "single",
+def initial_result(run_id: str, origin: datetime, mode: str = "single", total_origins: int = 1) -> dict:
+    return {"schema_version": "1.0", "run_id": run_id, "status": "queued", "mode": mode,
             "configuration_id": CONFIGURATION_ID, "is_mock": False,
             "origin_at": origin.isoformat(), "progress": {"completed_origins": 0, "blocked_origins": 0,
-                                                    "failed_origins": 0, "total_origins": 1},
+                                                    "failed_origins": 0, "total_origins": total_origins},
             "forecasts": [], "weather_snapshots": [], "model_manifests": [], "data_quality": {},
             "farm_aggregate": None,
             "farm_aggregate_reason": {"code": "AGGREGATION_RULE_UNAVAILABLE",
@@ -59,6 +60,20 @@ class RunStore:
     def load(self, run_id: str) -> dict | None:
         path = self.path(run_id)
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+    def latest_for_origin(self, origin: datetime) -> dict | None:
+        key = hashlib.sha256(origin.astimezone(timezone.utc).isoformat().encode()).hexdigest()[:20]
+        path = self.settings.artifacts_dir / "runs" / "latest" / f"{key}.json"
+        if not path.exists():
+            return None
+        pointer = json.loads(path.read_text(encoding="utf-8"))
+        return self.load(pointer["run_id"])
+
+    def remember_origin(self, result: dict) -> None:
+        origin = datetime.fromisoformat(result["origin_at"])
+        key = hashlib.sha256(origin.astimezone(timezone.utc).isoformat().encode()).hexdigest()[:20]
+        atomic_json(self.settings.artifacts_dir / "runs" / "latest" / f"{key}.json",
+                    {"run_id": result["run_id"], "origin_at": result["origin_at"]})
 
 
 def _step(result: dict, name: str, status: str, reason: str, started: str | None = None,
@@ -96,8 +111,10 @@ def _retrieve_first(settings: Settings, result: dict, turbine_id: str, origin: d
     last_error = None
     for index, run in enumerate(eligible):
         try:
-            snapshot = retrieve(settings, turbine_id, origin, run)
-            if snapshot.metadata["retries_used"]:
+            selection_reason = ("latest eligible cycle with full required coverage" if index == 0 else
+                                "earlier eligible cycle after newer candidate lacked full required coverage")
+            snapshot = retrieve(settings, turbine_id, origin, run, selection_reason=selection_reason)
+            if snapshot.metadata["retries_used"] and not snapshot.metadata.get("reused_snapshot"):
                 result["agent"]["decisions"].append({"action": "retry_provider", "turbine_id": turbine_id,
                     "run_at_utc": snapshot.metadata["run_at_utc"], "retries_used": snapshot.metadata["retries_used"],
                     "reason": "Transient weather provider error resolved within two retries"})
@@ -116,10 +133,13 @@ def _retrieve_first(settings: Settings, result: dict, turbine_id: str, origin: d
     raise WeatherBlocked("WEATHER_RUN_NOT_ELIGIBLE", "No eligible candidate weather run")
 
 
-def run_first_origin(settings: Settings, run_id: str | None = None) -> dict:
-    origin = settings.first_origin
+def run_first_origin(settings: Settings, run_id: str | None = None, origin: datetime | None = None,
+                     preloaded: dict | None = None) -> dict:
+    origin = origin or settings.first_origin
     result = initial_result(run_id or uuid.uuid4().hex, origin)
     store = RunStore(settings)
+    previous = store.latest_for_origin(origin)
+    result["input_fingerprints"] = {}
     store.save(result)
     result["status"] = "running"
     store.save(result)
@@ -129,7 +149,7 @@ def run_first_origin(settings: Settings, run_id: str | None = None) -> dict:
         number = turbine_id[-1]
         path = settings.data_dir / f"dataset_{number}.csv"
         try:
-            data = load_turbine(path, turbine_id, settings.zone)
+            data = preloaded[turbine_id] if preloaded is not None else load_turbine(path, turbine_id, settings.zone)
             datasets[turbine_id] = data
             result["data_quality"][turbine_id] = {**data.quality, "dataset_sha256": data.sha256,
                                                     "dataset_id": data.dataset_id}
@@ -184,12 +204,34 @@ def run_first_origin(settings: Settings, run_id: str | None = None) -> dict:
                   outputs=[snapshot.metadata["raw_path"]])
             _step(result, "validate_eligibility", "completed", "Historical availability and coverage proven")
             _step(result, "prepare_features", "completed", "Aligned 48 UTC valid hours to wind and temperature")
+            fingerprint_inputs = {"origin_at": origin.isoformat(), "turbine_id": turbine_id,
+                                  "dataset_sha256": datasets[turbine_id].sha256,
+                                  "model_version": fitted.manifest["model_version"],
+                                  "weather_snapshot_id": snapshot.metadata["weather_snapshot_id"],
+                                  "requested_coordinate": snapshot.metadata.get("requested_coordinate", COORDINATES[turbine_id][:2])}
+            fingerprint = hashlib.sha256(json.dumps(fingerprint_inputs, sort_keys=True).encode()).hexdigest()
+            result["input_fingerprints"][turbine_id] = fingerprint
+            old_rows = ([row for row in previous.get("forecasts", []) if row["turbine_id"] == turbine_id]
+                        if previous else [])
+            old_rows.sort(key=lambda row: row["lead_hours"])
+            same_input = bool(previous and previous.get("input_fingerprints", {}).get(turbine_id) == fingerprint
+                              and len(old_rows) == 48)
             try:
-                predicted = predict(fitted.model, snapshot.wind, snapshot.temperature)
+                predicted = ([row["power_normalized"] for row in old_rows] if same_input else
+                             predict(fitted.model, snapshot.wind, snapshot.temperature))
             except ValueError as exc:
                 raise WeatherBlocked("FORECAST_OUTPUT_INVALID", str(exc),
                                      {"model_version": fitted.manifest["model_version"]}) from exc
-            _step(result, "forecast", "completed", f"Predicted 48 hours for {turbine_id}")
+            changed_input = bool(previous and previous.get("input_fingerprints", {}).get(turbine_id)
+                                 and not same_input)
+            if same_input:
+                result["agent"]["decisions"].append({"action": "reuse_unchanged_calculation", "turbine_id": turbine_id,
+                    "previous_run_id": previous["run_id"], "input_fingerprint": fingerprint})
+            elif changed_input:
+                result["agent"]["decisions"].append({"action": "recalculate", "turbine_id": turbine_id,
+                    "previous_run_id": previous["run_id"], "input_fingerprint": fingerprint,
+                    "reason": "Effective calculation dependency changed"})
+            _step(result, "forecast", "completed", f"{'Reused' if same_input else 'Predicted'} 48 hours for {turbine_id}")
             for h, power in enumerate(predicted):
                 valid_start = origin + timedelta(hours=h)
                 valid_end = valid_start + timedelta(hours=1)
@@ -200,7 +242,9 @@ def run_first_origin(settings: Settings, run_id: str | None = None) -> dict:
                                             "weather_snapshot_id": snapshot.metadata["weather_snapshot_id"],
                                             "model_version": fitted.manifest["model_version"],
                                             "in_test_period": valid_start.month == 2 and valid_start.year == 2026,
-                                            "previous_run_id": None, "revision_delta": None, "quality_flags": []})
+                                            "previous_run_id": previous["run_id"] if changed_input and len(old_rows) == 48 else None,
+                                            "revision_delta": power - old_rows[h]["power_normalized"] if changed_input and len(old_rows) == 48 else None,
+                                            "quality_flags": []})
             result["turbine_outcomes"][turbine_id] = "completed"
         except WeatherBlocked as exc:
             snapshot_id = exc.details.get("weather_snapshot_id")
@@ -241,7 +285,10 @@ def run_first_origin(settings: Settings, run_id: str | None = None) -> dict:
     result["agent"]["decisions"].append({"action": action,
                                            "reason": "Weather availability or input is unverified" if action == "block" else ("Runtime/provider fault" if action == "fail" else "Validated forecast rows saved"),
                                            "recalculation_count": 0})
-    _step(result, "decide_recalculation", "completed", "No changed eligible input; recalculation count 0 of 1")
+    recalculated = any(item["action"] == "recalculate" for item in result["agent"]["decisions"])
+    result["agent"]["decisions"][-1]["recalculation_count"] = int(recalculated)
+    _step(result, "decide_recalculation", "completed",
+          f"Changed effective input {'recalculated' if recalculated else 'not detected'}; recalculation count {int(recalculated)} of 1")
     outcomes = list(result["turbine_outcomes"].values())
     if outcomes and all(x == "completed" for x in outcomes):
         result["status"] = "completed"
@@ -255,7 +302,94 @@ def run_first_origin(settings: Settings, run_id: str | None = None) -> dict:
     else:
         result["status"] = "failed"
         result["progress"]["failed_origins"] = 1
+    if any(outcome != "completed" for outcome in outcomes):
+        result["farm_aggregate_reason"] = {"code": "INCOMPLETE_TURBINE_PREDICTIONS",
+            "message": "At least one turbine lacks a validated 48-hour prediction; no station aggregation rule is supplied"}
     _step(result, "persist", "completed", "Atomic run JSON and hourly audit saved", outputs=[str(store.path(result["run_id"]))])
+    result["ended_at_utc"] = now_utc()
+    store.save(result)
+    if result["status"] in ("completed", "partial") and result["forecasts"]:
+        store.remember_origin(result)
+    return result
+
+
+def run_replay(settings: Settings, run_id: str | None = None, from_origin: datetime | None = None,
+               through_origin: datetime | None = None) -> dict:
+    first = from_origin or datetime.fromisoformat(FIRST_ORIGIN).astimezone(settings.zone)
+    last = through_origin or datetime.fromisoformat(LAST_ORIGIN).astimezone(settings.zone)
+    origins = [first + timedelta(days=day) for day in range((last.date() - first.date()).days + 1)]
+    result = initial_result(run_id or uuid.uuid4().hex, first, "replay", len(origins))
+    result["from_origin"] = first.isoformat()
+    result["through_origin"] = last.isoformat()
+    result["origins"] = []
+    result["summary"] = {"total_origins": len(origins), "success": 0, "blocked": 0, "failed": 0,
+                         "with_farm_aggregate": 0, "without_farm_aggregate": 0}
+    store = RunStore(settings)
+    store.save(result)
+    result["status"] = "running"
+    store.save(result)
+    try:
+        preloaded = load_all(settings.data_dir, settings.zone)
+    except (SourceQualityError, FileNotFoundError, UnicodeError):
+        preloaded = None  # Per-origin validation records the affected turbine and exact source error.
+    for origin in origins:
+        started = now_utc()
+        try:
+            child = run_first_origin(settings, origin=origin, preloaded=preloaded)
+        except Exception as exc:
+            _log(settings, result["run_id"], exc)
+            child = initial_result(uuid.uuid4().hex, origin)
+            child["status"] = "failed"
+            child["progress"]["failed_origins"] = 1
+            child["errors"].append(issue("RUN_RUNTIME_ERROR", "Unexpected origin fault; inspect local logs",
+                                         details={"origin_at": origin.isoformat()}))
+            child["ended_at_utc"] = now_utc()
+            store.save(child)
+        outcomes = child.get("turbine_outcomes", {})
+        if child["status"] == "completed":
+            category = "success"
+            result["progress"]["completed_origins"] += 1
+        elif child["status"] == "failed" or (child["status"] == "partial" and "blocked" not in outcomes.values()):
+            category = "failed"
+            result["progress"]["failed_origins"] += 1
+        else:
+            category = "blocked"
+            result["progress"]["blocked_origins"] += 1
+        result["summary"][category] += 1
+        has_aggregate = child.get("farm_aggregate") is not None
+        result["summary"]["with_farm_aggregate" if has_aggregate else "without_farm_aggregate"] += 1
+        result["origins"].append({"origin_at": origin.isoformat(), "run_id": child["run_id"],
+            "status": child["status"], "summary_category": category, "turbine_outcomes": outcomes,
+            "forecast_rows": len(child.get("forecasts", [])), "selected_weather": [
+                {"turbine_id": item.get("turbine_id"), "run_at_utc": item["run_at_utc"],
+                 "availability_method": item.get("availability_method"),
+                 "available_by_utc": item.get("available_by_utc"),
+                 "weather_snapshot_id": item["weather_snapshot_id"]}
+                for item in child.get("weather_snapshots", []) if item.get("eligibility") == "eligible"],
+            "errors": child.get("errors", []), "farm_aggregate": child.get("farm_aggregate"),
+            "farm_aggregate_reason": child.get("farm_aggregate_reason"),
+            "input_fingerprints": child.get("input_fingerprints", {})})
+        result["forecasts"].extend(child.get("forecasts", []))
+        result["weather_snapshots"].extend(child.get("weather_snapshots", []))
+        result["model_manifests"].extend(child.get("model_manifests", []))
+        if not result["data_quality"]:
+            result["data_quality"] = child.get("data_quality", {})
+        result["errors"].extend(child.get("errors", []))
+        _step(result, "run_origin", child["status"], f"{origin.isoformat()}: {child['status']}", started,
+              outputs=[str(store.path(child["run_id"]))])
+        store.save(result)
+    success, blocked, failed = (result["summary"][key] for key in ("success", "blocked", "failed"))
+    result["status"] = ("completed" if success == len(origins) else
+                        "partial" if success or (blocked and failed) else
+                        "blocked" if blocked else "failed")
+    if blocked or failed:
+        result["farm_aggregate_reason"] = {"code": "INCOMPLETE_TURBINE_PREDICTIONS",
+            "message": "At least one origin lacks validated turbine predictions; no station aggregation rule is supplied"}
+    result["agent"]["analysis"] = "Sequential origin outcomes and provenance are recorded in origins."
+    result["agent"]["decisions"].append({"action": "complete_replay", "reason": "All requested origins visited",
+                                          "visited_origins": len(result["origins"])})
+    _step(result, "persist", "completed", "Atomic replay and per-origin results saved",
+          outputs=[str(store.path(result["run_id"]))])
     result["ended_at_utc"] = now_utc()
     store.save(result)
     return result
