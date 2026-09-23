@@ -3,3 +3,8 @@ __pycache__/
 .pytest_cache/
 outputs/weather_cache/
 .docx_render/
+.deps/
+/backend/artifacts/models/
+/backend/artifacts/weather/
+/backend/artifacts/runs/
+/backend/artifacts/logs/

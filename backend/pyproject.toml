@@ -7,7 +7,10 @@ name = "agentic-wind-forecast"
 version = "0.1.0"
 description = "Reproducible agentic wind-farm generation forecasting for HackAlem AI"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "pandas>=2.0"]
+dependencies = ["numpy>=1.24", "pandas>=2.0", "scikit-learn>=1.4", "fastapi>=0.110", "uvicorn>=0.27", "joblib>=1.3", "certifi>=2025.1", "tzdata>=2024.1"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 wind-forecast = "agentic_forecast.cli:main"
